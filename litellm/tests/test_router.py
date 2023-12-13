@@ -226,7 +226,6 @@ def test_call_one_endpoint():
 			)
 
 			print("\n response", response)
-
 		asyncio.run(call_azure_completion())
 		asyncio.run(call_bedrock_claude())
 		asyncio.run(call_azure_embedding())
@@ -367,14 +366,15 @@ def test_function_calling():
 		}
 	]
 
-	router = Router(model_list=model_list, routing_strategy="latency-based-routing")
+	router = Router(model_list=model_list)
 	response = router.completion(model="gpt-3.5-turbo-0613", messages=messages, functions=functions)
 	router.reset()
 	print(response)
 
 def test_acompletion_on_router(): 
+	# tests acompletion + caching on router 
 	try:
-		litellm.set_verbose = False
+		litellm.set_verbose = True
 		model_list = [
 			{
 				"model_name": "gpt-3.5-turbo",
@@ -410,9 +410,10 @@ def test_acompletion_on_router():
 				timeout=30,
 				routing_strategy="simple-shuffle")
 		async def get_response(): 
-			response1 = await router.acompletion(model="gpt-3.5-turbo", messages=messages)
+			print("Testing acompletion + caching on router")
+			response1 = await router.acompletion(model="gpt-3.5-turbo", messages=messages, temperature=1)
 			print(f"response1: {response1}")
-			response2 = await router.acompletion(model="gpt-3.5-turbo", messages=messages)
+			response2 = await router.acompletion(model="gpt-3.5-turbo", messages=messages, temperature=1)
 			print(f"response2: {response2}")
 			assert response1.id == response2.id
 			assert len(response1.choices[0].message.content) > 0
@@ -427,7 +428,7 @@ def test_acompletion_on_router():
 		traceback.print_exc()
 		pytest.fail(f"Error occurred: {e}")
 
-# test_acompletion_on_router() 
+test_acompletion_on_router() 
 
 def test_function_calling_on_router(): 
 	try: 
@@ -506,7 +507,6 @@ def test_aembedding_on_router():
 			model="text-embedding-ada-002",
 			input=["good morning from litellm 2"],
 		)
-		print("sync embedding response: ", response)
 		router.reset()
 	except Exception as e:
 		traceback.print_exc()
@@ -626,13 +626,14 @@ def test_openai_completion_on_router():
 				messages=[
 					{
 						"role": "user",
-						"content": "hello from litellm test",
+						"content": f"hello from litellm test {time.time()}",
 					}
 				],
 				stream=True
 			)
 			complete_response = ""
 			print(response)
+			# if you want to see all the attributes and methods
 			async for chunk in response:
 				print(chunk)
 				complete_response += chunk.choices[0].delta.content or ""
@@ -742,7 +743,7 @@ def test_reading_keys_os_environ():
 		traceback.print_exc()
 		pytest.fail(f"Error occurred: {e}")
 
-test_reading_keys_os_environ()
+# test_reading_keys_os_environ()
 
 
 def test_reading_openai_keys_os_environ():

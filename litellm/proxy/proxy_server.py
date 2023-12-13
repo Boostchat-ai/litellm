@@ -1,4 +1,4 @@
-import sys, os, platform, time, copy, re, asyncio
+import sys, os, platform, time, copy, re, asyncio, inspect
 import threading, ast
 import shutil, random, traceback, requests
 from datetime import datetime, timedelta
@@ -93,14 +93,15 @@ def generate_feedback_box():
 import litellm
 from litellm.proxy.utils import (
     PrismaClient, 
-    get_instance_fn
+    get_instance_fn, 
+    ProxyLogging
 )
 import pydantic
 from litellm.proxy._types import *
 from litellm.caching import DualCache
-from litellm.health_check import perform_health_check
+from litellm.proxy.health_check import perform_health_check
 litellm.suppress_debug_info = True
-from fastapi import FastAPI, Request, HTTPException, status, Depends, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, status, Depends, BackgroundTasks, Header
 from fastapi.routing import APIRouter
 from fastapi.security import OAuth2PasswordBearer
 from fastapi.encoders import jsonable_encoder
@@ -193,15 +194,23 @@ otel_logging = False
 prisma_client: Optional[PrismaClient] = None
 user_api_key_cache = DualCache()
 user_custom_auth = None
+use_background_health_checks = None
+health_check_interval = None
+health_check_results = {}
+### INITIALIZE GLOBAL LOGGING OBJECT ###
+proxy_logging_obj = ProxyLogging(user_api_key_cache=user_api_key_cache)
 ### REDIS QUEUE ### 
 async_result = None
 celery_app_conn = None 
 celery_fn = None # Redis Queue for handling requests
 #### HELPER FUNCTIONS ####
 def print_verbose(print_statement):
-    global user_debug
-    if user_debug:
-        print(print_statement)
+    try:
+        global user_debug
+        if user_debug:
+            print(print_statement)
+    except:
+        pass
 
 def usage_telemetry(
     feature: str,
@@ -216,6 +225,13 @@ def _get_bearer_token(api_key: str):
     assert api_key.startswith("Bearer ") # ensure Bearer token passed in
     api_key = api_key.replace("Bearer ", "") # extract the token
     return api_key
+
+def _get_pydantic_json_dict(pydantic_obj: BaseModel) -> dict: 
+    try:
+        return pydantic_obj.model_dump() # type: ignore
+    except:
+        # if using pydantic v1
+        return pydantic_obj.dict()
 
 async def user_api_key_auth(request: Request, api_key: str = fastapi.Security(api_key_header)) -> UserAPIKeyAuth:
     global master_key, prisma_client, llm_model_list, user_custom_auth
@@ -236,51 +252,55 @@ async def user_api_key_auth(request: Request, api_key: str = fastapi.Security(ap
         if api_key is None: # only require api key if master key is set
             raise Exception(f"No api key passed in.")
 
-        route = request.url.path
+        route: str = request.url.path
 
         # note: never string compare api keys, this is vulenerable to a time attack. Use secrets.compare_digest instead
         is_master_key_valid = secrets.compare_digest(api_key, master_key)
         if is_master_key_valid:
             return UserAPIKeyAuth(api_key=master_key)
         
-        if (route == "/key/generate" or route == "/key/delete" or route == "/key/info") and not is_master_key_valid:
-            raise Exception(f"If master key is set, only master key can be used to generate, delete or get info for new keys")
+        if route.startswith("/key/") and not is_master_key_valid:
+            raise Exception(f"If master key is set, only master key can be used to generate, delete, update or get info for new keys")
 
-        if prisma_client: 
-            ## check for cache hit (In-Memory Cache)
-            valid_token = user_api_key_cache.get_cache(key=api_key)
-            if valid_token is None: 
-                ## check db 
-                cleaned_api_key = api_key
-                valid_token = await prisma_client.get_data(token=cleaned_api_key, expires=datetime.utcnow())
-                user_api_key_cache.set_cache(key=api_key, value=valid_token, ttl=60)
-            elif valid_token is not None: 
-                print(f"API Key Cache Hit!")
-            if valid_token:
-                litellm.model_alias_map = valid_token.aliases
-                config = valid_token.config
-                if config != {}:
-                    model_list = config.get("model_list", [])
-                    llm_model_list =  model_list
-                    print("\n new llm router model list", llm_model_list)
-                if len(valid_token.models) == 0: # assume an empty model list means all models are allowed to be called
-                    return_dict = {"api_key": valid_token.token}
-                    if valid_token.user_id:
-                        return_dict["user_id"] = valid_token.user_id
-                    return UserAPIKeyAuth(**return_dict)
-                else: 
-                    data = await request.json()
-                    model = data.get("model", None)
-                    if model in litellm.model_alias_map:
-                        model = litellm.model_alias_map[model]
-                    if model and model not in valid_token.models:
-                        raise Exception(f"Token not allowed to access model")
-                return_dict = {"api_key": valid_token.token}
-                if valid_token.user_id:
-                    return_dict["user_id"] = valid_token.user_id
-                return UserAPIKeyAuth(**return_dict)
+        if prisma_client is None: # if both master key + user key submitted, and user key != master key, and no db connected, raise an error
+            raise Exception("No connected db.")
+
+        ## check for cache hit (In-Memory Cache)
+        valid_token = user_api_key_cache.get_cache(key=api_key)
+        print(f"valid_token from cache: {valid_token}")
+        if valid_token is None: 
+            ## check db 
+            print(f"api key: {api_key}")
+            valid_token = await prisma_client.get_data(token=api_key, expires=datetime.utcnow())
+            print(f"valid token from prisma: {valid_token}")
+            user_api_key_cache.set_cache(key=api_key, value=valid_token, ttl=60)
+        elif valid_token is not None: 
+            print(f"API Key Cache Hit!")
+        if valid_token:
+            litellm.model_alias_map = valid_token.aliases
+            config = valid_token.config
+            if config != {}:
+                model_list = config.get("model_list", [])
+                llm_model_list =  model_list
+                print("\n new llm router model list", llm_model_list)
+            if len(valid_token.models) == 0: # assume an empty model list means all models are allowed to be called
+                api_key = valid_token.token
+                valid_token_dict = _get_pydantic_json_dict(valid_token)
+                valid_token_dict.pop("token", None)
+                return UserAPIKeyAuth(api_key=api_key, **valid_token_dict)
             else: 
-                raise Exception(f"Invalid token")
+                data = await request.json()
+                model = data.get("model", None)
+                if model in litellm.model_alias_map:
+                    model = litellm.model_alias_map[model]
+                if model and model not in valid_token.models:
+                    raise Exception(f"Token not allowed to access model")
+            api_key = valid_token.token
+            valid_token_dict = _get_pydantic_json_dict(valid_token)
+            valid_token_dict.pop("token", None)
+            return UserAPIKeyAuth(api_key=api_key, **valid_token_dict)
+        else: 
+            raise Exception(f"Invalid token")
     except Exception as e: 
         print(f"An exception occurred - {traceback.format_exc()}")
         if isinstance(e, HTTPException): 
@@ -292,10 +312,12 @@ async def user_api_key_auth(request: Request, api_key: str = fastapi.Security(ap
             )
 
 def prisma_setup(database_url: Optional[str]): 
-    global prisma_client
-    if database_url:
+    global prisma_client, proxy_logging_obj, user_api_key_cache
+
+    proxy_logging_obj._init_litellm_callbacks()
+    if database_url is not None:
         try: 
-            prisma_client = PrismaClient(database_url=database_url)
+            prisma_client = PrismaClient(database_url=database_url, proxy_logging_obj=proxy_logging_obj)
         except Exception as e:
             print("Error when initializing prisma, Ensure you run pip install prisma", e)
 
@@ -358,29 +380,25 @@ async def track_cost_callback(
     global prisma_client
     try:
         # check if it has collected an entire stream response
+        print(f"kwargs stream: {kwargs.get('stream', None)} + complete streaming response: {kwargs.get('complete_streaming_response', None)}")
         if "complete_streaming_response" in kwargs:
             # for tracking streaming cost we pass the "messages" and the output_text to litellm.completion_cost 
             completion_response=kwargs["complete_streaming_response"]
-            input_text = kwargs["messages"]
-            output_text = completion_response["choices"][0]["message"]["content"]
-            response_cost = litellm.completion_cost(
-                model = kwargs["model"],
-                messages = input_text,
-                completion=output_text
-            )
+            response_cost = litellm.completion_cost(completion_response=completion_response)
             print("streaming response_cost", response_cost)
-        # for non streaming responses
-        elif kwargs["stream"] is False: # regular response
-            input_text = kwargs.get("messages", "")
-            if isinstance(input_text, list): 
-                input_text = "".join(m["content"] for m in input_text)
+            user_api_key = kwargs["litellm_params"]["metadata"].get("user_api_key", None)
+            print(f"user_api_key - {user_api_key}; prisma_client - {prisma_client}")
+            if user_api_key and prisma_client: 
+                await update_prisma_database(token=user_api_key, response_cost=response_cost)
+        elif kwargs["stream"] == False: # for non streaming responses
+            response_cost = litellm.completion_cost(completion_response=completion_response)
             print(f"received completion response: {completion_response}")
-            response_cost = litellm.completion_cost(completion_response=completion_response, completion=input_text)
-            print("regular response_cost", response_cost)
-        user_api_key = kwargs["litellm_params"]["metadata"].get("user_api_key", None)
-        print(f"user_api_key - {user_api_key}; prisma_client - {prisma_client}")
-        if user_api_key and prisma_client: 
-            await update_prisma_database(token=user_api_key, response_cost=response_cost)
+            
+            print(f"regular response_cost: {response_cost}")
+            user_api_key = kwargs["litellm_params"]["metadata"].get("user_api_key", None)
+            print(f"user_api_key - {user_api_key}; prisma_client - {prisma_client}")
+            if user_api_key and prisma_client: 
+                await update_prisma_database(token=user_api_key, response_cost=response_cost)
     except Exception as e:
         print(f"error in tracking cost callback - {str(e)}")
 
@@ -415,8 +433,26 @@ def run_ollama_serve():
             LiteLLM Warning: proxy started with `ollama` model\n`ollama serve` failed with Exception{e}. \nEnsure you run `ollama serve`
         """)
 
+async def _run_background_health_check():
+    """
+    Periodically run health checks in the background on the endpoints. 
+
+    Update health_check_results, based on this.
+    """
+    global health_check_results, llm_model_list, health_check_interval
+    while True:
+        healthy_endpoints, unhealthy_endpoints = await perform_health_check(model_list=llm_model_list)
+
+        # Update the global variable with the health check results
+        health_check_results["healthy_endpoints"] = healthy_endpoints
+        health_check_results["unhealthy_endpoints"] = unhealthy_endpoints
+        health_check_results["healthy_count"] = len(healthy_endpoints)
+        health_check_results["unhealthy_count"] = len(unhealthy_endpoints)
+
+        await asyncio.sleep(health_check_interval)
+
 def load_router_config(router: Optional[litellm.Router], config_file_path: str):
-    global master_key, user_config_file_path, otel_logging, user_custom_auth
+    global master_key, user_config_file_path, otel_logging, user_custom_auth, user_custom_auth_path, use_background_health_checks, health_check_interval
     config = {}
     try: 
         if os.path.exists(config_file_path):
@@ -440,7 +476,79 @@ def load_router_config(router: Optional[litellm.Router], config_file_path: str):
         for key, value in environment_variables.items(): 
             os.environ[key] = value
 
-    ## GENERAL SERVER SETTINGS (e.g. master key,..)
+    ## LITELLM MODULE SETTINGS (e.g. litellm.drop_params=True,..)
+    litellm_settings = config.get('litellm_settings', None)
+    if litellm_settings is None: 
+        litellm_settings = {}
+    if litellm_settings: 
+        # ANSI escape code for blue text
+        blue_color_code = "\033[94m"
+        reset_color_code = "\033[0m"
+        for key, value in litellm_settings.items(): 
+            if key == "cache":
+                print(f"{blue_color_code}\nSetting Cache on Proxy")
+                from litellm.caching import Cache
+                if isinstance(value, dict):
+                    cache_type = value.get("type", "redis")
+                else:
+                    cache_type = "redis" # default to using redis on cache
+                cache_responses = True
+                cache_host = litellm.get_secret("REDIS_HOST", None)
+                cache_port = litellm.get_secret("REDIS_PORT", None)
+                cache_password = litellm.get_secret("REDIS_PASSWORD", None)
+
+                # Assuming cache_type, cache_host, cache_port, and cache_password are strings
+                print(f"{blue_color_code}Cache Type:{reset_color_code} {cache_type}")
+                print(f"{blue_color_code}Cache Host:{reset_color_code} {cache_host}")
+                print(f"{blue_color_code}Cache Port:{reset_color_code} {cache_port}")
+                print(f"{blue_color_code}Cache Password:{reset_color_code} {cache_password}")
+                print()
+
+                ## to pass a complete url, or set ssl=True, etc. just set it as `os.environ[REDIS_URL] = <your-redis-url>`, _redis.py checks for REDIS specific environment variables
+                litellm.cache = Cache(
+                    type=cache_type,
+                    host=cache_host,
+                    port=cache_port,
+                    password=cache_password
+                )
+                print(f"{blue_color_code}Set Cache on LiteLLM Proxy: {litellm.cache.cache}{reset_color_code} {cache_password}")
+            elif key == "callbacks":
+                litellm.callbacks = [get_instance_fn(value=value, config_file_path=config_file_path)]
+                print_verbose(f"{blue_color_code} Initialized Callbacks - {litellm.callbacks} {reset_color_code}")
+            elif key == "success_callback":
+                litellm.success_callback = []
+                
+                # intialize success callbacks
+                for callback in value:
+                    # user passed custom_callbacks.async_on_succes_logger. They need us to import a function
+                    if "." in callback: 
+                        litellm.success_callback.append(get_instance_fn(value=callback))
+                    # these are litellm callbacks - "langfuse", "sentry", "wandb"
+                    else:
+                        litellm.success_callback.append(callback)
+                        if callback == "traceloop":
+                            from traceloop.sdk import Traceloop
+                            print_verbose(f"{blue_color_code} Initializing Traceloop SDK - \nRunning:`Traceloop.init(app_name='Litellm-Server', disable_batch=True)`")
+                            Traceloop.init(app_name="Litellm-Server", disable_batch=True)
+                print_verbose(f"{blue_color_code} Initialized Success Callbacks - {litellm.success_callback} {reset_color_code}")
+            elif key == "failure_callback":
+                litellm.failure_callback = []
+                
+                # intialize success callbacks
+                for callback in value:
+                    # user passed custom_callbacks.async_on_succes_logger. They need us to import a function
+                    if "." in callback: 
+                        litellm.failure_callback.append(get_instance_fn(value=callback))
+                    # these are litellm callbacks - "langfuse", "sentry", "wandb"
+                    else:
+                        litellm.failure_callback.append(callback)
+                print_verbose(f"{blue_color_code} Initialized Success Callbacks - {litellm.failure_callback} {reset_color_code}")
+            else:
+                setattr(litellm, key, value)
+
+
+
+    ## GENERAL SERVER SETTINGS (e.g. master key,..) # do this after initializing litellm, to ensure sentry logging works for proxylogging
     general_settings = config.get("general_settings", {})
     if general_settings is None: 
         general_settings = {}
@@ -470,78 +578,49 @@ def load_router_config(router: Optional[litellm.Router], config_file_path: str):
         custom_auth = general_settings.get("custom_auth", None)
         if custom_auth:
             user_custom_auth = get_instance_fn(value=custom_auth, config_file_path=config_file_path)
-    ## LITELLM MODULE SETTINGS (e.g. litellm.drop_params=True,..)
-    litellm_settings = config.get('litellm_settings', None)
-    if litellm_settings: 
-        # ANSI escape code for blue text
-        blue_color_code = "\033[94m"
-        reset_color_code = "\033[0m"
-        for key, value in litellm_settings.items(): 
-            if key == "cache":
-                print(f"{blue_color_code}\nSetting Cache on Proxy")
-                from litellm.caching import Cache
-                cache_type = value["type"]
-                cache_host = litellm.get_secret("REDIS_HOST", None)
-                cache_port = litellm.get_secret("REDIS_PORT", None)
-                cache_password = litellm.get_secret("REDIS_PASSWORD", None)
+        ### BACKGROUND HEALTH CHECKS ###
+        # Enable background health checks
+        use_background_health_checks = general_settings.get("background_health_checks", False)
+        health_check_interval = general_settings.get("health_check_interval", 300)
 
-                # Assuming cache_type, cache_host, cache_port, and cache_password are strings
-                print(f"{blue_color_code}Cache Type:{reset_color_code} {cache_type}")
-                print(f"{blue_color_code}Cache Host:{reset_color_code} {cache_host}")
-                print(f"{blue_color_code}Cache Port:{reset_color_code} {cache_port}")
-                print(f"{blue_color_code}Cache Password:{reset_color_code} {cache_password}")
-                print()
-
-                ## to pass a complete url, just set it as `os.environ[REDIS_URL] = <your-redis-url>`, _redis.py checks for REDIS specific environment variables
-                litellm.cache = Cache(
-                    type=cache_type,
-                    host=cache_host,
-                    port=cache_port,
-                    password=cache_password
-                )
-            elif key == "callbacks":
-                litellm.callbacks = [get_instance_fn(value=value)]
-                print_verbose(f"{blue_color_code} Initialized Callbacks - {litellm.callbacks} {reset_color_code}")
-            elif key == "success_callback":
-                litellm.success_callback = []
-                
-                # intialize success callbacks
-                for callback in value:
-                    # user passed custom_callbacks.async_on_succes_logger. They need us to import a function
-                    if "." in callback: 
-                        litellm.success_callback.append(get_instance_fn(value=callback))
-                    # these are litellm callbacks - "langfuse", "sentry", "wandb"
-                    else:
-                        litellm.success_callback.append(callback)
-                print_verbose(f"{blue_color_code} Initialized Success Callbacks - {litellm.success_callback} {reset_color_code}")
-            elif key == "failure_callback":
-                litellm.failure_callback = []
-                
-                # intialize success callbacks
-                for callback in value:
-                    # user passed custom_callbacks.async_on_succes_logger. They need us to import a function
-                    if "." in callback: 
-                        litellm.failure_callback.append(get_instance_fn(value=callback))
-                    # these are litellm callbacks - "langfuse", "sentry", "wandb"
-                    else:
-                        litellm.failure_callback.append(callback)
-                print_verbose(f"{blue_color_code} Initialized Success Callbacks - {litellm.failure_callback} {reset_color_code}")
-            else:
-                setattr(litellm, key, value)
-                
+    router_params: dict = {
+        "num_retries": 3, 
+        "cache_responses": litellm.cache != None # cache if user passed in cache values
+    }
     ## MODEL LIST
     model_list = config.get('model_list', None)
     if model_list:
-        router = litellm.Router(model_list=model_list, num_retries=3)
+        router_params["model_list"] = model_list
         print(f"\033[32mLiteLLM: Proxy initialized with Config, Set models:\033[0m")
         for model in model_list:
             print(f"\033[32m    {model.get('model_name', '')}\033[0m")
             litellm_model_name = model["litellm_params"]["model"]
-            if "ollama" in litellm_model_name: 
+            litellm_model_api_base = model["litellm_params"].get("api_base", None)
+            if "ollama" in litellm_model_name and litellm_model_api_base is None: 
                 run_ollama_serve()
+    
+    ## ROUTER SETTINGS (e.g. routing_strategy, ...)
+    router_settings = config.get("router_settings", None)
+    if router_settings and isinstance(router_settings, dict):
+        arg_spec = inspect.getfullargspec(litellm.Router)
+        # model list already set
+        exclude_args = {
+            "self",
+            "model_list",
+        }
+
+        available_args = [
+            x for x in arg_spec.args if x not in exclude_args
+        ]
+
+        for k, v in router_settings.items(): 
+            if k in available_args: 
+                router_params[k] = v
+    
+    router = litellm.Router(**router_params) # type:ignore
     return router, model_list, general_settings
 
-async def generate_key_helper_fn(duration_str: Optional[str], models: list, aliases: dict, config: dict, spend: float, token: Optional[str]=None, user_id: Optional[str]=None):
+async def generate_key_helper_fn(duration: Optional[str], models: list, aliases: dict, config: dict, spend: float, token: Optional[str]=None, user_id: Optional[str]=None, max_parallel_requests: Optional[int]=None):
     global prisma_client
 
     if prisma_client is None: 
@@ -570,11 +649,11 @@ async def generate_key_helper_fn(duration_str: Optional[str], models: list, alia
         else:
             raise ValueError("Unsupported duration unit")
         
-    if duration_str is None: # allow tokens that never expire 
+    if duration is None: # allow tokens that never expire 
         expires = None
     else: 
-        duration = _duration_in_seconds(duration=duration_str)
-        expires = datetime.utcnow() + timedelta(seconds=duration)
+        duration_s = _duration_in_seconds(duration=duration)
+        expires = datetime.utcnow() + timedelta(seconds=duration_s)
     
     aliases_json = json.dumps(aliases)
     config_json = json.dumps(config)
@@ -588,13 +667,16 @@ async def generate_key_helper_fn(duration_str: Optional[str], models: list, alia
             "aliases": aliases_json,
             "config": config_json,
             "spend": spend, 
-            "user_id": user_id
+            "user_id": user_id, 
+            "max_parallel_requests": max_parallel_requests
         }
         new_verification_token = await prisma_client.insert_data(data=verification_token_data)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR)
     return {"token": token, "expires": new_verification_token.expires, "user_id": user_id}
+
+
 
 async def delete_verification_token(tokens: List):
     global prisma_client
@@ -708,8 +790,7 @@ def data_generator(response):
         except:
             yield f"data: {json.dumps(chunk)}\n\n"
 
-
-async def async_data_generator(response):
+async def async_data_generator(response, user_api_key_dict):
     print_verbose("inside generator")
     async for chunk in response:
         print_verbose(f"returned chunk: {chunk}")
@@ -762,43 +843,13 @@ def get_litellm_model_info(model: dict = {}):
         # if litellm does not have info on the model it should return {}
         return {}
     
-@app.middleware("http")
-async def rate_limit_per_token(request: Request, call_next):
-    global user_api_key_cache, general_settings
-    max_parallel_requests = general_settings.get("max_parallel_requests", None)
-    api_key = request.headers.get("Authorization")
-    if max_parallel_requests is not None and api_key is not None: # Rate limiting is enabled
-        api_key = _get_bearer_token(api_key=api_key)
-        # CHECK IF REQUEST ALLOWED
-        request_count_api_key = f"{api_key}_request_count"
-        current = user_api_key_cache.get_cache(key=request_count_api_key)
-        if current is None:
-            user_api_key_cache.set_cache(request_count_api_key, 1)
-        elif int(current) <  max_parallel_requests:
-            # Increase count for this token
-            user_api_key_cache.set_cache(request_count_api_key, int(current) + 1)
-        else: 
-            raise HTTPException(status_code=429, detail="Too many requests.")
-        
-
-        response = await call_next(request)
-
-        # Decrease count for this token
-        current = user_api_key_cache.get_cache(key=request_count_api_key)
-        user_api_key_cache.set_cache(request_count_api_key, int(current) - 1)
-
-        return response
-    else:  # Rate limiting is not enabled, just pass the request
-        response = await call_next(request)
-        return response
-
 @router.on_event("startup")
 async def startup_event():
-    global prisma_client, master_key
+    global prisma_client, master_key, use_background_health_checks
     import json
 
+    ### LOAD CONFIG ### 
     worker_config = litellm.get_secret("WORKER_CONFIG")
-    print(f"worker_config: {worker_config}")
     print_verbose(f"worker_config: {worker_config}")
     # check if it's a valid file path
     if os.path.isfile(worker_config):
@@ -807,22 +858,20 @@ async def startup_event():
         # if not, assume it's a json string
         worker_config = json.loads(os.getenv("WORKER_CONFIG"))
         initialize(**worker_config)
+    
+    
+    if use_background_health_checks:
+        asyncio.create_task(_run_background_health_check()) # start the background health check coroutine. 
+
     print_verbose(f"prisma client - {prisma_client}")
     if prisma_client: 
         await prisma_client.connect()
     
     if prisma_client is not None and master_key is not None: 
         # add master key to db
-        await generate_key_helper_fn(duration_str=None, models=[], aliases={}, config={}, spend=0, token=master_key)
+        await generate_key_helper_fn(duration=None, models=[], aliases={}, config={}, spend=0, token=master_key)
 
-@router.on_event("shutdown")
-async def shutdown_event():
-    global prisma_client, master_key, user_custom_auth
-    if prisma_client:
-        print("Disconnecting from Prisma")
-        await prisma_client.disconnect()
-    master_key = None
-    user_custom_auth = None
+
 #### API ENDPOINTS ####
 @router.get("/v1/models", dependencies=[Depends(user_api_key_auth)])
 @router.get("/models", dependencies=[Depends(user_api_key_auth)])  # if project requires model list
@@ -869,7 +918,7 @@ async def completion(request: Request, model: Optional[str] = None, user_api_key
         except: 
             data = json.loads(body_str)
         
-        data["user"] = user_api_key_dict.user_id
+        data["user"] = data.get("user", user_api_key_dict.user_id)
         data["model"] = (
             general_settings.get("completion_model", None) # server default
             or user_model # model name passed via cli args
@@ -904,10 +953,18 @@ async def completion(request: Request, model: Optional[str] = None, user_api_key
 @router.post("/chat/completions", dependencies=[Depends(user_api_key_auth)], tags=["chat/completions"])
 @router.post("/openai/deployments/{model:path}/chat/completions", dependencies=[Depends(user_api_key_auth)], tags=["chat/completions"]) # azure compatible endpoint
 async def chat_completion(request: Request, model: Optional[str] = None, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth), background_tasks: BackgroundTasks = BackgroundTasks()):
-    global general_settings, user_debug
+    global general_settings, user_debug, proxy_logging_obj
     try: 
         data = {}
         data = await request.json() # type: ignore 
+
+        # Include original request and headers in the data
+        data["proxy_server_request"] = {
+            "url": str(request.url),
+            "method": request.method,
+            "headers": dict(request.headers),
+            "body": copy.copy(data)  # use copy instead of deepcopy
+        }
 
         print_verbose(f"receiving data: {data}")
         data["model"] = (
@@ -929,6 +986,7 @@ async def chat_completion(request: Request, model: Optional[str] = None, user_ap
         else:
             data["metadata"] = {"user_api_key": user_api_key_dict.api_key}
             data["metadata"]["headers"] = dict(request.headers)
+        
         global user_temperature, user_request_timeout, user_max_tokens, user_api_base
         # override with user settings, these are params passed via cli
         if user_temperature: 
@@ -939,6 +997,11 @@ async def chat_completion(request: Request, model: Optional[str] = None, user_ap
             data["max_tokens"] = user_max_tokens
         if user_api_base: 
             data["api_base"] = user_api_base
+
+        ### CALL HOOKS ### - modify incoming data before calling the model
+        data = await proxy_logging_obj.pre_call_hook(user_api_key_dict=user_api_key_dict, data=data, call_type="completion")
+
+        ### ROUTE THE REQUEST ###
         router_model_names = [m["model_name"] for m in llm_model_list] if llm_model_list is not None else []
         if llm_router is not None and data["model"] in router_model_names: # model in router model list 
                 response = await llm_router.acompletion(**data)
@@ -948,11 +1011,15 @@ async def chat_completion(request: Request, model: Optional[str] = None, user_ap
             response = await llm_router.acompletion(**data)
         else: # router is not set
             response = await litellm.acompletion(**data)
+        
+        print(f"final response: {response}")
         if 'stream' in data and data['stream'] == True: # use generate_responses to stream responses
-            return StreamingResponse(async_data_generator(response), media_type='text/event-stream')
+            return StreamingResponse(async_data_generator(user_api_key_dict=user_api_key_dict, response=response), media_type='text/event-stream')
+        
         background_tasks.add_task(log_input_output, request, response) # background task for logging to OTEL 
         return response
-    except Exception as e: 
+    except Exception as e:
+        await proxy_logging_obj.post_call_failure_hook(user_api_key_dict=user_api_key_dict, original_exception=e) 
         print(f"\033[1;31mAn error occurred: {e}\n\n Debug this by setting `--debug`, e.g. `litellm --model gpt-3.5-turbo --debug`")
         router_model_names = [m["model_name"] for m in llm_model_list] if llm_model_list is not None else []
         if llm_router is not None and data.get("model", "") in router_model_names: 
@@ -969,28 +1036,39 @@ async def chat_completion(request: Request, model: Optional[str] = None, user_ap
                 print(f"{key}: {value}")
         if user_debug: 
             traceback.print_exc()
-        error_traceback = traceback.format_exc()
-        error_msg = f"{str(e)}\n\n{error_traceback}"
-        try:
-            status = e.status_code # type: ignore
-        except:
-            status = 500
-        raise HTTPException(
-            status_code=status,
-            detail=error_msg
-        )
+        
+        if isinstance(e, HTTPException):
+            raise e
+        else:
+            error_traceback = traceback.format_exc()
+            error_msg = f"{str(e)}\n\n{error_traceback}"
+            try:
+                status = e.status_code # type: ignore
+            except:
+                status = 500
+            raise HTTPException(
+                status_code=status,
+                detail=error_msg
+            )
 
 @router.post("/v1/embeddings", dependencies=[Depends(user_api_key_auth)], response_class=ORJSONResponse)
 @router.post("/embeddings", dependencies=[Depends(user_api_key_auth)], response_class=ORJSONResponse)
 async def embeddings(request: Request, user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth), background_tasks: BackgroundTasks = BackgroundTasks()): 
+    global proxy_logging_obj
     try: 
-
         # Use orjson to parse JSON data, orjson speeds up requests significantly
         body = await request.body()
         data = orjson.loads(body)
 
-        
-        data["user"] = user_api_key_dict.user_id
+         # Include original request and headers in the data
+        data["proxy_server_request"] = {
+            "url": str(request.url),
+            "method": request.method,
+            "headers": dict(request.headers),
+            "body": copy.copy(data)  # use copy instead of deepcopy
+        }
+
+        data["user"] = data.get("user", user_api_key_dict.user_id)
         data["model"] = (
             general_settings.get("embedding_model", None) # server default
             or user_model # model name passed via cli args
@@ -1000,10 +1078,11 @@ async def embeddings(request: Request, user_api_key_dict: UserAPIKeyAuth = Depen
             data["model"] = user_model
         if "metadata" in data:
             data["metadata"]["user_api_key"] = user_api_key_dict.api_key
+            data["metadata"]["headers"] = dict(request.headers)
         else:
             data["metadata"] = {"user_api_key": user_api_key_dict.api_key}
+            data["metadata"]["headers"] = dict(request.headers)
         router_model_names = [m["model_name"] for m in llm_model_list] if llm_model_list is not None else []
-        print(f"received data: {data['input']}")
         if "input" in data and isinstance(data['input'], list) and isinstance(data['input'][0], list) and isinstance(data['input'][0][0], int): # check if array of tokens passed in
             # check if non-openai/azure model called - e.g. for langchain integration
             if llm_model_list is not None and data["model"] in router_model_names: 
@@ -1018,7 +1097,9 @@ async def embeddings(request: Request, user_api_key_dict: UserAPIKeyAuth = Depen
                             input_list.append(litellm.decode(model="gpt-3.5-turbo", tokens=i))
                         data["input"] = input_list
                         break
-
+        
+        ### CALL HOOKS ### - modify incoming data / reject request before calling the model
+        data = await proxy_logging_obj.pre_call_hook(user_api_key_dict=user_api_key_dict, data=data, call_type="embeddings")
         ## ROUTE TO CORRECT ENDPOINT ##
         if llm_router is not None and data["model"] in router_model_names: # model in router model list 
             response = await llm_router.aembedding(**data)
@@ -1027,17 +1108,17 @@ async def embeddings(request: Request, user_api_key_dict: UserAPIKeyAuth = Depen
         else:
             response = await litellm.aembedding(**data)
         background_tasks.add_task(log_input_output, request, response) # background task for logging to OTEL 
+
         return response
     except Exception as e:
+        await proxy_logging_obj.post_call_failure_hook(user_api_key_dict=user_api_key_dict, original_exception=e) 
         traceback.print_exc()
         raise e
-    except Exception as e: 
-        pass
 
 #### KEY MANAGEMENT #### 
 
 @router.post("/key/generate", tags=["key management"], dependencies=[Depends(user_api_key_auth)], response_model=GenerateKeyResponse)
-async def generate_key_fn(request: Request, data: GenerateKeyRequest): 
+async def generate_key_fn(request: Request, data: GenerateKeyRequest, Authorization: Optional[str] = Header(None)): 
     """
     Generate an API key based on the provided data. 
 
@@ -1049,25 +1130,40 @@ async def generate_key_fn(request: Request, data: GenerateKeyRequest):
     - aliases: Optional[dict] - Any alias mappings, on top of anything in the config.yaml model list. - https://docs.litellm.ai/docs/proxy/virtual_keys#managing-auth---upgradedowngrade-models
     - config: Optional[dict] - any key-specific configs, overrides config in config.yaml 
     - spend: Optional[int] - Amount spent by key. Default is 0. Will be updated by proxy whenever key is used. https://docs.litellm.ai/docs/proxy/virtual_keys#managing-auth---tracking-spend
+    - max_parallel_requests: Optional[int] - Rate limit a user based on the number of parallel requests. Raises 429 error, if user's parallel requests > x.
 
     Returns:
-    - key: The generated api key 
-    - expires: Datetime object for when key expires. 
+    - key: (str) The generated api key 
+    - expires: (datetime) Datetime object for when key expires.
+    - user_id: (str) Unique user id - used for tracking spend across multiple keys for same user id.
     """
     # data = await request.json()
-    duration_str = data.duration  # Default to 1 hour if duration is not provided
-    models = data.models # Default to an empty list (meaning allow token to call all models)
-    aliases = data.aliases # Default to an empty dict (no alias mappings, on top of anything in the config.yaml model_list)
-    config = data.config
-    spend = data.spend
-    user_id = data.user_id
-    if isinstance(models, list):
-        response = await generate_key_helper_fn(duration_str=duration_str, models=models, aliases=aliases, config=config, spend=spend, user_id=user_id)
-        return GenerateKeyResponse(key=response["token"], expires=response["expires"], user_id=response["user_id"])
-    else: 
+    data_json = data.json()   # type: ignore
+    response = await generate_key_helper_fn(**data_json)
+    return GenerateKeyResponse(key=response["token"], expires=response["expires"], user_id=response["user_id"])
+
+@router.post("/key/update", tags=["key management"], dependencies=[Depends(user_api_key_auth)])
+async def update_key_fn(request: Request, data: UpdateKeyRequest):
+    """
+    Update an existing key
+    """
+    global prisma_client
+    try: 
+        data_json: dict = data.json()
+        key = data_json.pop("key")
+        # get the row from db 
+        if prisma_client is None: 
+            raise Exception("Not connected to DB!")
+        
+        non_default_values = {k: v for k, v in data_json.items() if v is not None}
+        print(f"non_default_values: {non_default_values}")
+        response = await prisma_client.update_data(token=key, data={**non_default_values, "token": key})
+        return {"key": key, **non_default_values}
+        # update based on remaining passed in values 
+    except Exception as e: 
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "models param must be a list"},
+            detail={"error": str(e)},
         )
 
 @router.post("/key/delete", tags=["key management"], dependencies=[Depends(user_api_key_auth)])
@@ -1115,10 +1211,12 @@ async def add_new_model(model_params: ModelParams):
         
         print_verbose(f"Loaded config: {config}")
         # Add the new model to the config
+        model_info = model_params.model_info.json()
+        model_info = {k: v for k, v in model_info.items() if v is not None}
         config['model_list'].append({
             'model_name': model_params.model_name,
             'litellm_params': model_params.litellm_params,
-            'model_info': model_params.model_info
+            'model_info': model_info
         })
 
         # Save the updated config
@@ -1132,10 +1230,11 @@ async def add_new_model(model_params: ModelParams):
         return {"message": "Model added successfully"}
 
     except Exception as e:
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 #### [BETA] - This is a beta endpoint, format might change based on user feedback https://github.com/BerriAI/litellm/issues/933. If you need a stable endpoint use /model/info
-@router.get("/v1/model/info", description="Provides more info about each model in /models, including config.yaml descriptions (except api key and api base)", tags=["model management"], dependencies=[Depends(user_api_key_auth)])
+@router.get("/model/info", description="Provides more info about each model in /models, including config.yaml descriptions (except api key and api base)", tags=["model management"], dependencies=[Depends(user_api_key_auth)])
 async def model_info_v1(request: Request):
     global llm_model_list, general_settings, user_config_file_path
     # Load existing config
@@ -1163,7 +1262,7 @@ async def model_info_v1(request: Request):
 
 
 #### [BETA] - This is a beta endpoint, format might change based on user feedback. - https://github.com/BerriAI/litellm/issues/933
-@router.get("/model/info", description="Provides more info about each model in /models, including config.yaml descriptions (except api key and api base)", tags=["model management"], dependencies=[Depends(user_api_key_auth)])
+@router.get("/v1/model/info", description="Provides more info about each model in /models, including config.yaml descriptions (except api key and api base)", tags=["model management"], dependencies=[Depends(user_api_key_auth)])
 async def model_info(request: Request):
     global llm_model_list, general_settings, user_config_file_path
     # Load existing config
@@ -1297,27 +1396,63 @@ async def retrieve_server_log(request: Request):
 
 #### BASIC ENDPOINTS #### 
 
+@router.get("/config/yaml", tags=["config.yaml"])
+async def config_yaml_endpoint(config_info: ConfigYAML): 
+    """
+    This is a mock endpoint, to show what you can set in config.yaml details in the Swagger UI. 
+
+    Parameters:
+
+    The config.yaml object has the following attributes:
+    - **model_list**: *Optional[List[ModelParams]]* - A list of supported models on the server, along with model-specific configurations. ModelParams includes "model_name" (name of the model), "litellm_params" (litellm-specific parameters for the model), and "model_info" (additional info about the model such as id, mode, cost per token, etc). 
+
+    - **litellm_settings**: *Optional[dict]*: Settings for the litellm module. You can specify multiple properties like "drop_params", "set_verbose", "api_base", "cache".
+    
+    - **general_settings**: *Optional[ConfigGeneralSettings]*: General settings for the server like "completion_model" (default model for chat completion calls), "use_azure_key_vault" (option to load keys from azure key vault), "master_key" (key required for all calls to proxy), and others. 
+
+    Please, refer to each class's description for a better understanding of the specific attributes within them.
+
+    Note: This is a mock endpoint primarily meant for demonstration purposes, and does not actually provide or change any configurations.
+    """
+    return {"hello": "world"}
+
+
 @router.get("/test")
 async def test_endpoint(request: Request): 
     return {"route": request.url.path}
 
-@router.get("/health", description="Check the health of all the endpoints in config.yaml", tags=["health"], dependencies=[Depends(user_api_key_auth)])
+@router.get("/health", tags=["health"], dependencies=[Depends(user_api_key_auth)])
 async def health_endpoint(request: Request, model: Optional[str] = fastapi.Query(None, description="Specify the model name (optional)")):
-    global llm_model_list
+    """
+    Check the health of all the endpoints in config.yaml
+
+    To run health checks in the background, add this to config.yaml: 
+    ```
+    general_settings:
+        # ... other settings
+        background_health_checks: True
+    ```
+    else, the health checks will be run on models when /health is called.
+    """
+    global health_check_results, use_background_health_checks
 
     if llm_model_list is None: 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={"error": "Model list not initialized"},
         )
-    healthy_endpoints, unhealthy_endpoints = await perform_health_check(llm_model_list, model)
+    
+    if use_background_health_checks:
+        return health_check_results
+    else:
+        healthy_endpoints, unhealthy_endpoints = await perform_health_check(llm_model_list, model)
 
-    return {
-        "healthy_endpoints": healthy_endpoints,
-        "unhealthy_endpoints": unhealthy_endpoints,
-        "healthy_count": len(healthy_endpoints),
-        "unhealthy_count": len(unhealthy_endpoints),
-    }
+        return {
+            "healthy_endpoints": healthy_endpoints,
+            "unhealthy_endpoints": unhealthy_endpoints,
+            "healthy_count": len(healthy_endpoints),
+            "unhealthy_count": len(unhealthy_endpoints),
+        }
 
 @router.get("/")
 async def home(request: Request):
@@ -1339,6 +1474,29 @@ async def get_routes():
         routes.append(route_info)
 
     return {"routes": routes}
+
+
+@router.on_event("shutdown")
+async def shutdown_event():
+    global prisma_client, master_key, user_custom_auth
+    if prisma_client:
+        print("Disconnecting from Prisma")
+        await prisma_client.disconnect()
+    
+    ## RESET CUSTOM VARIABLES ## 
+    cleanup_router_config_variables()
+
+def cleanup_router_config_variables():
+    global master_key, user_config_file_path, otel_logging, user_custom_auth, user_custom_auth_path, use_background_health_checks, health_check_interval
+    
+    # Set all variables to None
+    master_key = None
+    user_config_file_path = None
+    otel_logging = None
+    user_custom_auth = None
+    user_custom_auth_path = None
+    use_background_health_checks = None
+    health_check_interval = None
 
 
 app.include_router(router)

@@ -132,6 +132,9 @@ def map_finish_reason(finish_reason: str): # openai supports 5 stop sequences - 
         return "content_filter"
     elif finish_reason == "ERROR": # openai currently doesn't support an 'error' finish reason
         return "stop"
+    # huggingface mapping https://huggingface.github.io/text-generation-inference/#/Text%20Generation%20Inference/generate_stream
+    elif finish_reason == "eos_token" or finish_reason == "stop_sequence":
+        return "stop"
     return finish_reason
 
 class FunctionCall(OpenAIObject):
@@ -174,6 +177,14 @@ class Message(OpenAIObject):
     def __setitem__(self, key, value):
         # Allow dictionary-style assignment of attributes
         setattr(self, key, value)
+
+    def json(self, **kwargs):
+        try:
+            return self.model_dump() # noqa
+        except:
+            # if using pydantic v1
+            return self.dict()
+
 
 class Delta(OpenAIObject):
     def __init__(self, content=None, role=None, **params):
@@ -512,8 +523,11 @@ class TextCompletionResponse(OpenAIObject):
 
 ############################################################
 def print_verbose(print_statement):
-    if litellm.set_verbose:
-        print(print_statement) # noqa
+    try:
+        if litellm.set_verbose:
+            print(print_statement) # noqa
+    except:
+        pass
 
 ####### LOGGING ###################
 from enum import Enum
@@ -559,19 +573,25 @@ class Logging:
             **self.optional_params
         }
 
+    def _pre_call(self, input, api_key, model=None, additional_args={}): 
+        """
+        Common helper function across the sync + async pre-call function
+        """
+        # print_verbose(f"logging pre call for model: {self.model} with call type: {self.call_type}")
+        self.model_call_details["input"] = input
+        self.model_call_details["api_key"] = api_key
+        self.model_call_details["additional_args"] = additional_args
+        self.model_call_details["log_event_type"] = "pre_api_call"
+        if (
+                model
+            ):  # if model name was changes pre-call, overwrite the initial model call name with the new one
+                self.model_call_details["model"] = model
+
     def pre_call(self, input, api_key, model=None, additional_args={}):
         # Log the exact input to the LLM API
         litellm.error_logs['PRE_CALL'] = locals()
         try:
-            # print_verbose(f"logging pre call for model: {self.model} with call type: {self.call_type}")
-            self.model_call_details["input"] = input
-            self.model_call_details["api_key"] = api_key
-            self.model_call_details["additional_args"] = additional_args
-            self.model_call_details["log_event_type"] = "pre_api_call"
-            if (
-                model
-            ):  # if model name was changes pre-call, overwrite the initial model call name with the new one
-                self.model_call_details["model"] = model
+            self._pre_call(input=input, api_key=api_key, model=model, additional_args=additional_args)
 
             # User Logging -> if you pass in a custom logging function
             headers = additional_args.get("headers", {})
@@ -685,6 +705,34 @@ class Logging:
             if capture_exception:  # log this error to sentry for debugging
                 capture_exception(e)
 
+    async def async_pre_call(self, result=None, start_time=None, end_time=None, **kwargs):
+        """
+       Â Implementing async callbacks, to handle asyncio event loop issues when custom integrations need to use async functions.
+        """
+        start_time, end_time, result = self._success_handler_helper_fn(start_time=start_time, end_time=end_time, result=result)
+        print_verbose(f"Async input callbacks: {litellm._async_input_callback}")
+        for callback in litellm._async_input_callback:
+            try: 
+                if isinstance(callback, CustomLogger): # custom logger class 
+                    print_verbose(f"Async input callbacks: CustomLogger")
+                    asyncio.create_task(callback.async_log_input_event(
+                            model=self.model,
+                            messages=self.messages,
+                            kwargs=self.model_call_details,
+                        ))
+                if callable(callback): # custom logger functions
+                    print_verbose(f"Async success callbacks: async_log_event")
+                    asyncio.create_task(customLogger.async_log_input_event(
+                        model=self.model,
+                        messages=self.messages,
+                        kwargs=self.model_call_details,
+                        print_verbose=print_verbose,
+                        callback_func=callback
+                    ))
+            except: 
+                print_verbose(
+                    f"LiteLLM.LoggingError: [Non-Blocking] Exception occurred while success logging {traceback.format_exc()}"
+                )
     def post_call(self, original_response, input=None, api_key=None,  additional_args={}):
         # Log the exact result from the LLM API, for streaming - log the type of response received
         litellm.error_logs['POST_CALL'] = locals()
@@ -761,29 +809,13 @@ class Logging:
                 end_time = datetime.datetime.now()
             self.model_call_details["log_event_type"] = "successful_api_call"
             self.model_call_details["end_time"] = end_time
-            complete_streaming_response = None
-            
-            ## BUILD COMPLETE STREAMED RESPONSE
-            if self.stream: 
-                if result.choices[0].finish_reason is not None: # if it's the last chunk
-                    self.streaming_chunks.append(result)
-                    complete_streaming_response = litellm.stream_chunk_builder(self.streaming_chunks, messages=self.model_call_details.get("messages", None))
-                else:
-                    self.streaming_chunks.append(result)
-            elif isinstance(result, OpenAIObject):
-                result = result.model_dump()
-
-            if complete_streaming_response: 
-                self.model_call_details["complete_streaming_response"] = complete_streaming_response
-
-            print_verbose(f"success callbacks: {litellm.success_callback}")
 
             if litellm.max_budget and self.stream:
                 time_diff = (end_time - start_time).total_seconds()
                 float_diff = float(time_diff)
                 litellm._current_cost += litellm.completion_cost(model=self.model, prompt="", completion=result["content"], total_time=float_diff)
 
-            return start_time, end_time, result, complete_streaming_response
+            return start_time, end_time, result
         except: 
             pass
 
@@ -791,10 +823,31 @@ class Logging:
         print_verbose(
                 f"Logging Details LiteLLM-Success Call"
             )
+        # print(f"original response in success handler: {self.model_call_details['original_response']}")
         try:
-            start_time, end_time, result, complete_streaming_response = self._success_handler_helper_fn(start_time=start_time, end_time=end_time, result=result)
-            print_verbose(f"success callbacks: {litellm.success_callback}")
+            print_verbose(f"success callbacks: {litellm.success_callback}")          
+            ## BUILD COMPLETE STREAMED RESPONSE
+            complete_streaming_response = None
+            if self.stream == True and self.model_call_details.get("litellm_params", {}).get("acompletion", False) == True:
+                # if it's acompletion == True, chunks are built/appended in async_success_handler
+                if result.choices[0].finish_reason is not None: # if it's the last chunk
+                    streaming_chunks = self.streaming_chunks + [result]
+                    complete_streaming_response = litellm.stream_chunk_builder(streaming_chunks, messages=self.model_call_details.get("messages", None))
+            else:
+                # this is a completion() call
+                if self.stream == True: 
+                    print_verbose("success callback - assembling complete streaming response")
+                    if result.choices[0].finish_reason is not None: # if it's the last chunk
+                        print_verbose(f"success callback - Got the very Last chunk. Assembling {self.streaming_chunks}")
+                        self.streaming_chunks.append(result)
+                        complete_streaming_response = litellm.stream_chunk_builder(self.streaming_chunks, messages=self.model_call_details.get("messages", None))
+                        print_verbose(f"success callback - complete streamign response{complete_streaming_response}")
+                    else:
+                        self.streaming_chunks.append(result)
+            if complete_streaming_response: 
+                self.model_call_details["complete_streaming_response"] = complete_streaming_response
 
+            start_time, end_time, result = self._success_handler_helper_fn(start_time=start_time, end_time=end_time, result=result)
             for callback in litellm.success_callback:
                 try:
                     if callback == "lite_debugger":
@@ -811,22 +864,6 @@ class Logging:
                             call_type = self.call_type, 
                             stream = self.stream,
                         )
-                    if callback == "api_manager":
-                        print_verbose("reaches api manager for updating model cost")
-                        litellm.apiManager.update_cost(completion_obj=result, user=self.user)
-                    if callback == "cache":
-                        if litellm.cache != None and self.model_call_details.get('optional_params', {}).get('stream', False) == True:
-                            litellm_call_id = self.litellm_params["litellm_call_id"]
-                            if litellm_call_id in self.litellm_params["stream_response"]:
-                                # append for the given call_id
-                                if self.litellm_params["stream_response"][litellm_call_id]["choices"][0]["message"]["content"] == "default":
-                                    self.litellm_params["stream_response"][litellm_call_id]["choices"][0]["message"]["content"] = result["content"] # handle first try
-                                else:
-                                    self.litellm_params["stream_response"][litellm_call_id]["choices"][0]["message"]["content"] += result["content"]
-                            else: # init a streaming response for this call id
-                                new_model_response = ModelResponse(choices=[Choices(message=Message(content="default"))])
-                                self.litellm_params["stream_response"][litellm_call_id] = new_model_response
-                            litellm.cache.add_cache(self.litellm_params["stream_response"][litellm_call_id], **self.model_call_details)
                     if callback == "promptlayer":
                         print_verbose("reaches promptlayer for logging!")
                         promptLayerLogger.log_event(
@@ -914,6 +951,7 @@ class Logging:
                             print_verbose=print_verbose,
                         )
                     if callback == "langfuse":
+                        global langFuseLogger
                         print_verbose("reaches langfuse for logging!")
                         kwargs = {}
                         for k, v in self.model_call_details.items(): 
@@ -926,7 +964,8 @@ class Logging:
                             else:
                                 print_verbose("reaches langfuse for streaming logging!")
                                 result = kwargs["complete_streaming_response"]
-
+                        if langFuseLogger is None:
+                            langFuseLogger = LangFuseLogger()
                         langFuseLogger.log_event(
                             kwargs=kwargs,
                             response_obj=result,
@@ -934,6 +973,19 @@ class Logging:
                             end_time=end_time,
                             print_verbose=print_verbose,
                         )
+                    if callback == "cache" and litellm.cache is not None:
+                        # this only logs streaming once, complete_streaming_response exists i.e when stream ends
+                        print_verbose("success_callback: reaches cache for logging!")
+                        kwargs = self.model_call_details
+                        if self.stream:
+                            if "complete_streaming_response" not in kwargs:
+                                print_verbose(f"success_callback: reaches cache for logging, there is no complete_streaming_response. Kwargs={kwargs}\n\n")
+                                return
+                            else:
+                                print_verbose("success_callback: reaches cache for logging, there is a complete_streaming_response. Adding to cache")
+                                result = kwargs["complete_streaming_response"]
+                                # only add to cache once we have a complete streaming response
+                                litellm.cache.add_cache(result, **kwargs)
                     if callback == "traceloop":
                         deep_copy = {}
                         for k, v in self.model_call_details.items(): 
@@ -946,7 +998,8 @@ class Logging:
                             end_time=end_time,
                             print_verbose=print_verbose,
                         )
-                    if isinstance(callback, CustomLogger): # custom logger class 
+                    elif isinstance(callback, CustomLogger) and self.model_call_details.get("litellm_params", {}).get("acompletion", False) == False and self.model_call_details.get("litellm_params", {}).get("aembedding", False) == False: # custom logger class 
+                        print_verbose(f"success callbacks: Running Custom Logger Class")      
                         if self.stream and complete_streaming_response is None:
                             callback.log_stream_event(
                                 kwargs=self.model_call_details,
@@ -956,7 +1009,8 @@ class Logging:
                                 )
                         else:
                             if self.stream and complete_streaming_response:
-                                self.model_call_details["complete_response"] = self.model_call_details.pop("complete_streaming_response", complete_streaming_response)
+                                self.model_call_details["complete_response"] = self.model_call_details.get("complete_streaming_response", {})
+                                result = self.model_call_details["complete_response"]
                             callback.log_success_event(
                                 kwargs=self.model_call_details,
                                 response_obj=result,
@@ -964,6 +1018,7 @@ class Logging:
                                 end_time=end_time,
                             )
                     if callable(callback): # custom logger functions
+                        print_verbose(f"success callbacks: Running Custom Callback Function")
                         customLogger.log_event(
                             kwargs=self.model_call_details,
                             response_obj=result,
@@ -992,19 +1047,63 @@ class Logging:
         """
         Implementing async callbacks, to handle asyncio event loop issues when custom integrations need to use async functions.
         """
-        start_time, end_time, result, complete_streaming_response = self._success_handler_helper_fn(start_time=start_time, end_time=end_time, result=result)
-        print_verbose(f"success callbacks: {litellm.success_callback}")
-
+        print_verbose(f"Async success callbacks: {litellm._async_success_callback}")
+        ## BUILD COMPLETE STREAMED RESPONSE
+        complete_streaming_response = None
+        if self.stream: 
+            if result.choices[0].finish_reason is not None: # if it's the last chunk
+                self.streaming_chunks.append(result)
+                # print_verbose(f"final set of received chunks: {self.streaming_chunks}")
+                try: 
+                    complete_streaming_response = litellm.stream_chunk_builder(self.streaming_chunks, messages=self.model_call_details.get("messages", None))
+                except: 
+                    complete_streaming_response = None
+            else:
+                self.streaming_chunks.append(result)
+        if complete_streaming_response: 
+            self.model_call_details["complete_streaming_response"] = complete_streaming_response
+        start_time, end_time, result = self._success_handler_helper_fn(start_time=start_time, end_time=end_time, result=result)
         for callback in litellm._async_success_callback:
             try: 
+                if callback == "cache" and litellm.cache is not None:
+                    # set_cache once complete streaming response is built
+                    print_verbose("async success_callback: reaches cache for logging!")
+                    kwargs = self.model_call_details
+                    if self.stream:
+                        if "complete_streaming_response" not in kwargs:
+                            print_verbose(f"async success_callback: reaches cache for logging, there is no complete_streaming_response. Kwargs={kwargs}\n\n")
+                            return
+                        else:
+                            print_verbose("async success_callback: reaches cache for logging, there is a complete_streaming_response. Adding to cache")
+                            result = kwargs["complete_streaming_response"]
+                            # only add to cache once we have a complete streaming response
+                            litellm.cache.add_cache(result, **kwargs)
                 if isinstance(callback, CustomLogger): # custom logger class 
-                    await callback.async_log_success_event(
-                        kwargs=self.model_call_details,
-                        response_obj=result,
-                        start_time=start_time,
-                        end_time=end_time,
-                    )
+                    print_verbose(f"Async success callbacks: CustomLogger")
+                    if self.stream:
+                        if "complete_streaming_response" in self.model_call_details:
+                            await callback.async_log_success_event(
+                                kwargs=self.model_call_details,
+                                response_obj=self.model_call_details["complete_streaming_response"],
+                                start_time=start_time,
+                                end_time=end_time,
+                            )
+                        else: 
+                            await callback.async_log_stream_event( # [TODO]: move this to being an async log stream event function 
+                                kwargs=self.model_call_details,
+                                response_obj=result,
+                                start_time=start_time,
+                                end_time=end_time
+                                )
+                    else:
+                        await callback.async_log_success_event(
+                            kwargs=self.model_call_details,
+                            response_obj=result,
+                            start_time=start_time,
+                            end_time=end_time,
+                        )
                 if callable(callback): # custom logger functions
+                    print_verbose(f"Async success callbacks: async_log_event")
                     await customLogger.async_log_event(
                         kwargs=self.model_call_details,
                         response_obj=result,
@@ -1018,24 +1117,29 @@ class Logging:
                     f"LiteLLM.LoggingError: [Non-Blocking] Exception occurred while success logging {traceback.format_exc()}"
                 )
 
+    def _failure_handler_helper_fn(self, exception, traceback_exception, start_time=None, end_time=None):
+        if start_time is None:
+            start_time = self.start_time
+        if end_time is None:
+            end_time = datetime.datetime.now()
+
+        # on some exceptions, model_call_details is not always initialized, this ensures that we still log those exceptions
+        if not hasattr(self, "model_call_details"):
+            self.model_call_details = {}
+
+        self.model_call_details["log_event_type"] = "failed_api_call"
+        self.model_call_details["exception"] = exception
+        self.model_call_details["traceback_exception"] = traceback_exception
+        self.model_call_details["end_time"] = end_time
+        self.model_call_details.setdefault("original_response", None)
+        return start_time, end_time
+
     def failure_handler(self, exception, traceback_exception, start_time=None, end_time=None):
         print_verbose(
                 f"Logging Details LiteLLM-Failure Call"
             )
         try:
-            if start_time is None:
-                start_time = self.start_time
-            if end_time is None:
-                end_time = datetime.datetime.now()
-
-            # on some exceptions, model_call_details is not always initialized, this ensures that we still log those exceptions
-            if not hasattr(self, "model_call_details"):
-                self.model_call_details = {}
-
-            self.model_call_details["log_event_type"] = "failed_api_call"
-            self.model_call_details["exception"] = exception
-            self.model_call_details["traceback_exception"] = traceback_exception
-            self.model_call_details["end_time"] = end_time
+            start_time, end_time = self._failure_handler_helper_fn(exception=exception, traceback_exception=traceback_exception, start_time=start_time, end_time=end_time)
             result = None # result sent to all loggers, init this to None incase it's not created 
             for callback in litellm.failure_callback:
                 try:
@@ -1101,7 +1205,7 @@ class Logging:
                             print_verbose=print_verbose,
                             callback_func=callback
                         )
-                    elif isinstance(callback, CustomLogger): # custom logger class 
+                    elif isinstance(callback, CustomLogger) and self.model_call_details.get("litellm_params", {}).get("acompletion", False) == False and self.model_call_details.get("litellm_params", {}).get("aembedding", False) == False: # custom logger class 
                         callback.log_failure_event(
                             start_time=start_time,
                             end_time=end_time,
@@ -1122,20 +1226,13 @@ class Logging:
                 f"LiteLLM.LoggingError: [Non-Blocking] Exception occurred while failure logging {traceback.format_exc()}"
             )
             pass
+
     async def async_failure_handler(self, exception, traceback_exception, start_time=None, end_time=None):
         """
         Implementing async callbacks, to handle asyncio event loop issues when custom integrations need to use async functions.
         """
-        # on some exceptions, model_call_details is not always initialized, this ensures that we still log those exceptions
-        if not hasattr(self, "model_call_details"):
-            self.model_call_details = {}
-
-        self.model_call_details["log_event_type"] = "failed_api_call"
-        self.model_call_details["exception"] = exception
-        self.model_call_details["traceback_exception"] = traceback_exception
-        self.model_call_details["end_time"] = end_time
-        result = {} # result sent to all loggers, init this to None incase it's not created 
-
+        start_time, end_time = self._failure_handler_helper_fn(exception=exception, traceback_exception=traceback_exception, start_time=start_time, end_time=end_time)
+        result = None # result sent to all loggers, init this to None incase it's not created 
         for callback in litellm._async_failure_callback:
             try: 
                 if isinstance(callback, CustomLogger): # custom logger class 
@@ -1154,7 +1251,7 @@ class Logging:
                         print_verbose=print_verbose,
                         callback_func=callback
                     )              
-            except: 
+            except Exception as e: 
                 print_verbose(
                     f"LiteLLM.LoggingError: [Non-Blocking] Exception occurred while success logging {traceback.format_exc()}"
                 )
@@ -1259,6 +1356,7 @@ def client(original_function):
                         litellm._async_success_callback.append(callback)
                     if callback not in litellm._async_failure_callback:
                         litellm._async_failure_callback.append(callback)
+                print_verbose(f"Initialized litellm callbacks, Async Success Callbacks: {litellm._async_success_callback}")
             if (
                 len(litellm.input_callback) > 0
                 or len(litellm.success_callback) > 0
@@ -1276,6 +1374,17 @@ def client(original_function):
                     function_id=function_id
                 )
             ## ASYNC CALLBACKS
+            if len(litellm.input_callback) > 0:
+                removed_async_items = []
+                for index, callback in enumerate(litellm.input_callback):
+                    if inspect.iscoroutinefunction(callback):
+                        litellm._async_input_callback.append(callback)
+                        removed_async_items.append(index)
+
+                # Pop the async items from input_callback in reverse order to avoid index issues
+                for index in reversed(removed_async_items):
+                    litellm.input_callback.pop(index)
+
             if len(litellm.success_callback) > 0: 
                 removed_async_items = []
                 for index, callback in enumerate(litellm.success_callback): 
@@ -1294,9 +1403,9 @@ def client(original_function):
                         litellm._async_failure_callback.append(callback)
                         removed_async_items.append(index)
 
-                # Pop the async items from success_callback in reverse order to avoid index issues
+                # Pop the async items from failure_callback in reverse order to avoid index issues
                 for index in reversed(removed_async_items):
-                    litellm.success_callback.pop(index)
+                    litellm.failure_callback.pop(index)
             if add_breadcrumb:
                 add_breadcrumb(
                     category="litellm.llm_call",
@@ -1382,7 +1491,6 @@ def client(original_function):
 
             # [OPTIONAL] CHECK CACHE
             # remove this after deprecating litellm.caching
-            print_verbose(f"litellm.caching: {litellm.caching}; litellm.caching_with_models: {litellm.caching_with_models}; litellm.cache: {litellm.cache}")
             if (litellm.caching or litellm.caching_with_models) and litellm.cache is None:
                 litellm.cache = Cache() 
 
@@ -1392,9 +1500,10 @@ def client(original_function):
                 # checking cache
                 if (litellm.cache != None or litellm.caching or litellm.caching_with_models):
                     print_verbose(f"Checking Cache")
+                    preset_cache_key = litellm.cache.get_cache_key(*args, **kwargs)
+                    kwargs["preset_cache_key"] = preset_cache_key # for streaming calls, we need to pass the preset_cache_key
                     cached_result = litellm.cache.get_cache(*args, **kwargs)
                     if cached_result != None:
-                        print_verbose(f"Cache Hit!")
                         if "detail" in cached_result: 
                             # implies an error occurred 
                             pass
@@ -1402,7 +1511,7 @@ def client(original_function):
                             call_type = original_function.__name__
                             print_verbose(f"Cache Response Object routing: call_type - {call_type}; cached_result instace: {type(cached_result)}")
                             if call_type == CallTypes.completion.value and isinstance(cached_result, dict):
-                                return convert_to_model_response_object(response_object=cached_result, model_response_object=ModelResponse())
+                                return convert_to_model_response_object(response_object=cached_result, model_response_object=ModelResponse(), stream = kwargs.get("stream", False))
                             elif call_type == CallTypes.embedding.value and isinstance(cached_result, dict):
                                 return convert_to_model_response_object(response_object=cached_result, response_type="embedding")
                             else: 
@@ -1432,6 +1541,7 @@ def client(original_function):
                 litellm.cache.add_cache(result, *args, **kwargs)
 
             # LOG SUCCESS - handle streaming success logging in the _next_ object, remove `handle_success` once it's deprecated
+            print_verbose(f"Wrapper: Completed Call, calling success_handler")
             threading.Thread(target=logging_obj.success_handler, args=(result, start_time, end_time)).start()
             # threading.Thread(target=logging_obj.success_handler, args=(result, start_time, end_time)).start()
             my_thread = threading.Thread(
@@ -1509,14 +1619,20 @@ def client(original_function):
             # if caching is false, don't run this 
             if (kwargs.get("caching", None) is None and litellm.cache is not None) or kwargs.get("caching", False) == True: # allow users to control returning cached responses from the completion function
                 # checking cache
-                if (litellm.cache != None):
+                print_verbose(f"INSIDE CHECKING CACHE")
+                if litellm.cache is not None:
                     print_verbose(f"Checking Cache")
                     cached_result = litellm.cache.get_cache(*args, **kwargs)
                     if cached_result != None:
                         print_verbose(f"Cache Hit!")
                         call_type = original_function.__name__
                         if call_type == CallTypes.acompletion.value and isinstance(cached_result, dict):
-                            return convert_to_model_response_object(response_object=cached_result, model_response_object=ModelResponse())
+                            if kwargs.get("stream", False) == True:
+                                return convert_to_streaming_response_async(
+                                    response_object=cached_result,
+                                )
+                            else:
+                                return convert_to_model_response_object(response_object=cached_result, model_response_object=ModelResponse())
                         else:
                             return cached_result
             # MODEL CALL
@@ -1538,6 +1654,7 @@ def client(original_function):
             if litellm.caching or litellm.caching_with_models or litellm.cache != None: # user init a cache object
                 litellm.cache.add_cache(result, *args, **kwargs)
             # LOG SUCCESS - handle streaming success logging in the _next_ object
+            print_verbose(f"Async Wrapper: Completed Call, calling async_success_handler: {logging_obj.async_success_handler}")
             asyncio.create_task(logging_obj.async_success_handler(result, start_time, end_time))
             threading.Thread(target=logging_obj.success_handler, args=(result, start_time, end_time)).start()
             # RETURN RESULT
@@ -1545,6 +1662,19 @@ def client(original_function):
                 result._response_ms = (end_time - start_time).total_seconds() * 1000 # return response latency in ms like openai
             return result
         except Exception as e: 
+            traceback_exception = traceback.format_exc()
+            crash_reporting(*args, **kwargs, exception=traceback_exception)
+            end_time = datetime.datetime.now()
+            if logging_obj:
+                try:
+                    logging_obj.failure_handler(e, traceback_exception, start_time, end_time) # DO NOT MAKE THREADED - router retry fallback relies on this!
+                except Exception as e: 
+                    raise e
+                try:
+                    await logging_obj.async_failure_handler(e, traceback_exception, start_time, end_time)
+                except Exception as e:
+                    raise e
+            
             call_type = original_function.__name__
             if call_type == CallTypes.acompletion.value:
                 num_retries = (
@@ -1554,27 +1684,24 @@ def client(original_function):
                 )
                 litellm.num_retries = None # set retries to None to prevent infinite loops 
                 context_window_fallback_dict = kwargs.get("context_window_fallback_dict", {})
-
+                
                 if num_retries: 
-                    kwargs["num_retries"] = num_retries
-                    kwargs["original_function"] = original_function
-                    if (isinstance(e, openai.RateLimitError)): # rate limiting specific error 
-                        kwargs["retry_strategy"] = "exponential_backoff_retry"
-                    elif (isinstance(e, openai.APIError)): # generic api error
-                        kwargs["retry_strategy"] = "constant_retry"
-                    return await litellm.acompletion_with_retries(*args, **kwargs)
+                    try: 
+                        kwargs["num_retries"] = num_retries
+                        kwargs["original_function"] = original_function
+                        if (isinstance(e, openai.RateLimitError)): # rate limiting specific error 
+                            kwargs["retry_strategy"] = "exponential_backoff_retry"
+                        elif (isinstance(e, openai.APIError)): # generic api error
+                            kwargs["retry_strategy"] = "constant_retry"
+                        return await litellm.acompletion_with_retries(*args, **kwargs)
+                    except:
+                        pass
                 elif isinstance(e, litellm.exceptions.ContextWindowExceededError) and context_window_fallback_dict and model in context_window_fallback_dict:
                     if len(args) > 0:
                         args[0]  = context_window_fallback_dict[model]
                     else:
                         kwargs["model"] = context_window_fallback_dict[model]
                     return await original_function(*args, **kwargs)
-            traceback_exception = traceback.format_exc()
-            crash_reporting(*args, **kwargs, exception=traceback_exception)
-            end_time = datetime.datetime.now()
-            if logging_obj:
-                logging_obj.failure_handler(e, traceback_exception, start_time, end_time) # DO NOT MAKE THREADED - router retry fallback relies on this!
-                asyncio.create_task(logging_obj.async_failure_handler(e, traceback_exception, start_time, end_time))
             raise e
 
     is_coroutine = inspect.iscoroutinefunction(original_function)
@@ -1849,8 +1976,6 @@ def completion_cost(
         - If an error occurs during execution, the function returns 0.0 without blocking the user's execution path.
     """
     try:
-        if messages != []:
-            prompt = " ".join([message["content"] for message in messages])
         # Handle Inputs to completion_cost
         prompt_tokens = 0
         completion_tokens = 0
@@ -1860,7 +1985,10 @@ def completion_cost(
             completion_tokens = completion_response['usage']['completion_tokens']
             model = model or completion_response['model'] # check if user passed an override for model, if it's none check completion_response['model']
         else:
-            prompt_tokens = token_counter(model=model, text=prompt)
+            if len(messages) > 0:
+                prompt_tokens = token_counter(model=model, messages=messages)
+            elif len(prompt) > 0: 
+                prompt_tokens = token_counter(model=model, text=prompt)
             completion_tokens = token_counter(model=model, text=completion)
         
         # Calculate cost based on prompt_tokens, completion_tokens
@@ -1953,7 +2081,6 @@ def register_model(model_cost: Union[str, dict]):
     return model_cost
 
 def get_litellm_params(
-    return_async=False,
     api_key=None,
     force_timeout=600,
     azure=False,
@@ -1967,10 +2094,14 @@ def get_litellm_params(
     litellm_call_id=None,
     model_alias_map=None,
     completion_call_id=None,
-    metadata=None
+    metadata=None,
+    model_info=None,
+    proxy_server_request=None,
+    acompletion=None,
+    preset_cache_key = None
 ):
     litellm_params = {
-        "return_async": return_async,
+        "acompletion": acompletion,
         "api_key": api_key,
         "force_timeout": force_timeout,
         "logger_fn": logger_fn,
@@ -1981,11 +2112,47 @@ def get_litellm_params(
         "model_alias_map": model_alias_map,
         "completion_call_id": completion_call_id,
         "metadata": metadata,
+        "model_info": model_info,
+        "proxy_server_request": proxy_server_request,
+        "preset_cache_key": preset_cache_key,
         "stream_response": {} # litellm_call_id: ModelResponse Dict
     }
 
     return litellm_params
 
+
+def get_optional_params_embeddings(
+    # 2 optional params
+    user=None, 
+    encoding_format=None,
+    custom_llm_provider="",
+    **kwargs
+):
+    # retrieve all parameters passed to the function
+    passed_params = locals()
+    custom_llm_provider = passed_params.pop("custom_llm_provider", None)
+    special_params = passed_params.pop("kwargs")
+    for k, v in special_params.items():
+        passed_params[k] = v
+    
+    default_params = {
+        "user": None,
+        "encoding_format": None
+    }
+
+    non_default_params = {k: v for k, v in passed_params.items() if (k in default_params and v != default_params[k])}
+
+    ## raise exception if non-default value passed for non-openai/azure embedding calls
+    if custom_llm_provider != "openai" and custom_llm_provider != "azure":
+        if len(non_default_params.keys()) > 0: 
+            if litellm.drop_params is True: 
+                for k in non_default_params.keys(): 
+                    passed_params.pop(k, None)
+                return passed_params
+            raise UnsupportedParamsError(status_code=500, message=f"Setting user/encoding format is not supported by {custom_llm_provider}. To drop it from the call, set `litellm.drop_params = True`.")
+    
+    final_params = {**non_default_params, **kwargs}
+    return final_params
 
 def get_optional_params(  # use the openai defaults
     # 12 optional params
@@ -2579,10 +2746,10 @@ def get_llm_provider(model: str, custom_llm_provider: Optional[str] = None, api_
         elif model in litellm.anthropic_models:
             custom_llm_provider = "anthropic"
         ## cohere
-        elif model in litellm.cohere_models:
+        elif model in litellm.cohere_models or model in litellm.cohere_embedding_models:
             custom_llm_provider = "cohere"
         ## replicate
-        elif model in litellm.replicate_models or ":" in model:
+        elif model in litellm.replicate_models or (":" in model and len(model)>64):
             model_parts = model.split(":")
             if len(model_parts) > 1 and len(model_parts[1])==64: ## checks if model name has a 64 digit code - e.g. "meta/llama-2-70b-chat:02e509c789964a7ea8736978a43525956ef40397be9033abf9fd2badfe68c9e3"
                 custom_llm_provider = "replicate"
@@ -2618,17 +2785,11 @@ def get_llm_provider(model: str, custom_llm_provider: Optional[str] = None, api_
         elif model in litellm.petals_models:
             custom_llm_provider = "petals"
         ## bedrock
-        elif model in litellm.bedrock_models:
+        elif model in litellm.bedrock_models or model in litellm.bedrock_embedding_models:
             custom_llm_provider = "bedrock"
         # openai embeddings
         elif model in litellm.open_ai_embedding_models:
             custom_llm_provider = "openai"
-        # cohere embeddings
-        elif model in litellm.cohere_embedding_models:
-            custom_llm_provider = "cohere"
-        elif model in litellm.bedrock_embedding_models:
-            custom_llm_provider = "bedrock"
-
         if custom_llm_provider is None or custom_llm_provider=="":
             print() # noqa
             print("\033[1;31mProvider List: https://docs.litellm.ai/docs/providers\033[0m") # noqa
@@ -3409,12 +3570,117 @@ def handle_failure(exception, traceback_exception, start_time, end_time, args, k
         exception_logging(logger_fn=user_logger_fn, exception=e)
         pass
 
+async def convert_to_streaming_response_async(response_object: Optional[dict]=None):
+    """
+    Asynchronously converts a response object to a streaming response.
 
-def convert_to_model_response_object(response_object: Optional[dict]=None, model_response_object: Optional[Union[ModelResponse, EmbeddingResponse]]=None, response_type: Literal["completion", "embedding"] = "completion"):
+    Args:
+        response_object (Optional[dict]): The response object to be converted. Defaults to None.
+
+    Raises:
+        Exception: If the response object is None.
+
+    Yields:
+        ModelResponse: The converted streaming response object.
+
+    Returns:
+        None
+    """
+    if response_object is None:
+        raise Exception("Error in response object format")
+
+    model_response_object = ModelResponse(stream=True)
+
+    if model_response_object is None:
+        raise Exception("Error in response creating model response object")
+
+    choice_list = []
+
+    for idx, choice in enumerate(response_object["choices"]):
+        delta = Delta(
+            content=choice["message"].get("content", None),
+            role=choice["message"]["role"],
+            function_call=choice["message"].get("function_call", None),
+            tool_calls=choice["message"].get("tool_calls", None)
+        )
+        finish_reason = choice.get("finish_reason", None)
+
+        if finish_reason is None:
+            finish_reason = choice.get("finish_details")
+
+        choice = StreamingChoices(finish_reason=finish_reason, index=idx, delta=delta)
+        choice_list.append(choice)
+
+    model_response_object.choices = choice_list
+
+    if "usage" in response_object and response_object["usage"] is not None:
+        model_response_object.usage = Usage(
+            completion_tokens=response_object["usage"].get("completion_tokens", 0),
+            prompt_tokens=response_object["usage"].get("prompt_tokens", 0),
+            total_tokens=response_object["usage"].get("total_tokens", 0)
+        )
+
+
+    if "id" in response_object:
+        model_response_object.id = response_object["id"]
+
+    if "system_fingerprint" in response_object:
+        model_response_object.system_fingerprint = response_object["system_fingerprint"]
+
+    if "model" in response_object:
+        model_response_object.model = response_object["model"]
+
+    yield model_response_object
+    await asyncio.sleep(0)
+
+def convert_to_streaming_response(response_object: Optional[dict]=None):
+    # used for yielding Cache hits when stream == True
+    if response_object is None:
+        raise Exception("Error in response object format")
+
+    model_response_object = ModelResponse(stream=True)
+    choice_list=[]
+    for idx, choice in enumerate(response_object["choices"]): 
+        delta = Delta(
+            content=choice["message"].get("content", None), 
+            role=choice["message"]["role"], 
+            function_call=choice["message"].get("function_call", None), 
+            tool_calls=choice["message"].get("tool_calls", None)
+        )
+        finish_reason = choice.get("finish_reason", None)
+        if finish_reason == None:
+            # gpt-4 vision can return 'finish_reason' or 'finish_details'
+            finish_reason = choice.get("finish_details")
+        choice = StreamingChoices(finish_reason=finish_reason, index=idx, delta=delta)
+        choice_list.append(choice)
+    model_response_object.choices = choice_list
+
+    if "usage" in response_object and response_object["usage"] is not None:
+        model_response_object.usage.completion_tokens = response_object["usage"].get("completion_tokens", 0) # type: ignore
+        model_response_object.usage.prompt_tokens = response_object["usage"].get("prompt_tokens", 0) # type: ignore
+        model_response_object.usage.total_tokens = response_object["usage"].get("total_tokens", 0) # type: ignore
+
+    if "id" in response_object: 
+        model_response_object.id = response_object["id"]
+
+    if "system_fingerprint" in response_object:
+        model_response_object.system_fingerprint = response_object["system_fingerprint"]
+
+    if "model" in response_object: 
+        model_response_object.model = response_object["model"]
+    yield model_response_object
+
+
+def convert_to_model_response_object(response_object: Optional[dict]=None, model_response_object: Optional[Union[ModelResponse, EmbeddingResponse]]=None, response_type: Literal["completion", "embedding"] = "completion",  stream = False):
         try: 
             if response_type == "completion" and (model_response_object is None or isinstance(model_response_object, ModelResponse)): 
                 if response_object is None or model_response_object is None:
                     raise Exception("Error in response object format")
+                if stream == True:
+                    # for returning cached responses, we need to yield a generator
+                    return convert_to_streaming_response(
+                        response_object=response_object
+                    )
                 choice_list=[]
                 for idx, choice in enumerate(response_object["choices"]): 
                     message = Message(
@@ -4880,9 +5146,6 @@ class CustomStreamWrapper:
         self.special_tokens = ["<|assistant|>", "<|system|>", "<|user|>", "<s>", "</s>"]
         self.holding_chunk = "" 
         self.complete_response = ""
-        if self.logging_obj:
-                # Log the type of the received item
-                self.logging_obj.post_call(str(type(completion_stream)))
 
     def __iter__(self):
         return self
@@ -4906,10 +5169,6 @@ class CustomStreamWrapper:
             return chunk 
         except Exception as e: 
             raise e
-    
-    def logging(self, text):
-        if self.logging_obj: 
-            self.logging_obj.post_call(text)
     
     def check_special_tokens(self, chunk: str, finish_reason: Optional[str]): 
         hold = False
@@ -5250,6 +5509,7 @@ class CustomStreamWrapper:
     
     def chunk_creator(self, chunk):
         model_response = ModelResponse(stream=True, model=self.model)
+        model_response.choices = [StreamingChoices()]
         model_response.choices[0].finish_reason = None
         response_obj = {}
         try:
@@ -5311,8 +5571,15 @@ class CustomStreamWrapper:
                         self.sent_last_chunk = True
             elif self.custom_llm_provider and self.custom_llm_provider == "vertex_ai":
                 try:
-
-                    completion_obj["content"] = str(chunk)
+                    # print(chunk)
+                    if hasattr(chunk, 'text'):
+                        # vertexAI chunks return 
+                        # MultiCandidateTextGenerationResponse(text=' ```python\n# This Python code says "Hi" 100 times.\n\n# Create', _prediction_response=Prediction(predictions=[{'candidates': [{'content': ' ```python\n# This Python code says "Hi" 100 times.\n\n# Create', 'author': '1'}], 'citationMetadata': [{'citations': None}], 'safetyAttributes': [{'blocked': False, 'scores': None, 'categories': None}]}], deployed_model_id='', model_version_id=None, model_resource_name=None, explanations=None), is_blocked=False, safety_attributes={}, candidates=[ ```python
+                        # This Python code says "Hi" 100 times.
+                        # Create])
+                        completion_obj["content"] = chunk.text
+                    else:
+                        completion_obj["content"] = str(chunk)
                 except StopIteration as e:
                     if self.sent_last_chunk: 
                         raise e 
@@ -5333,6 +5600,7 @@ class CustomStreamWrapper:
                     model_response.choices[0].finish_reason = response_obj["finish_reason"]
                     self.sent_last_chunk = True
             elif self.custom_llm_provider == "sagemaker":
+                print_verbose(f"ENTERS SAGEMAKER STREAMING")
                 if len(self.completion_stream)==0:
                     if self.sent_last_chunk: 
                         raise StopIteration
@@ -5340,6 +5608,7 @@ class CustomStreamWrapper:
                         model_response.choices[0].finish_reason = "stop"
                         self.sent_last_chunk = True
                 new_chunk = self.completion_stream
+                print_verbose(f"sagemaker chunk: {new_chunk}")
                 completion_obj["content"] = new_chunk
                 self.completion_stream = self.completion_stream[len(self.completion_stream):]
             elif self.custom_llm_provider == "petals":
@@ -5417,16 +5686,19 @@ class CustomStreamWrapper:
                             completion_obj["role"] = "assistant"
                             self.sent_first_chunk = True
                         model_response.choices[0].delta = Delta(**completion_obj)
-                    # LOGGING
-                    threading.Thread(target=self.logging_obj.success_handler, args=(model_response,)).start()
                     print_verbose(f"model_response: {model_response}")
                     return model_response
                 else: 
                     return 
             elif model_response.choices[0].finish_reason:
+                # flush any remaining holding chunk 
+                if len(self.holding_chunk) > 0:
+                    if model_response.choices[0].delta.content is None:
+                        model_response.choices[0].delta.content = self.holding_chunk
+                    else:
+                        model_response.choices[0].delta.content = self.holding_chunk + model_response.choices[0].delta.content
+                    self.holding_chunk = "" 
                 model_response.choices[0].finish_reason = map_finish_reason(model_response.choices[0].finish_reason) # ensure consistent output to openai
-                # LOGGING
-                threading.Thread(target=self.logging_obj.success_handler, args=(model_response,)).start()
                 return model_response
             elif response_obj is not None and response_obj.get("original_chunk", None) is not None: # function / tool calling branch - only set for openai/azure compatible endpoints
                 # enter this branch when no content has been passed in response
@@ -5447,8 +5719,6 @@ class CustomStreamWrapper:
                 if self.sent_first_chunk == False:
                     model_response.choices[0].delta["role"] = "assistant"
                     self.sent_first_chunk = True
-                # LOGGING
-                threading.Thread(target=self.logging_obj.success_handler, args=(model_response,)).start() # log response
                 return model_response
             else: 
                 return
@@ -5457,8 +5727,6 @@ class CustomStreamWrapper:
         except Exception as e: 
             traceback_exception = traceback.format_exc()
             e.message = str(e)
-             # LOG FAILURE - handle streaming failure logging in the _next_ object, remove `handle_failure` once it's deprecated
-            threading.Thread(target=self.logging_obj.failure_handler, args=(e, traceback_exception)).start()
             raise exception_type(model=self.model, custom_llm_provider=self.custom_llm_provider, original_exception=e)
 
     ## needs to handle the empty string case (even starting chunk can be an empty string)
@@ -5469,14 +5737,23 @@ class CustomStreamWrapper:
                     chunk = self.completion_stream
                 else:
                     chunk = next(self.completion_stream)
+                print_verbose(f"value of chunk: {chunk} ")
                 if chunk is not None and chunk != b'':
+                    print_verbose(f"PROCESSED CHUNK PRE CHUNK CREATOR: {chunk}")
                     response = self.chunk_creator(chunk=chunk)
-                    if response is not None:
-                        return response
+                    print_verbose(f"PROCESSED CHUNK POST CHUNK CREATOR: {response}")
+                    if response is None: 
+                        continue
+                    ## LOGGING
+                    threading.Thread(target=self.logging_obj.success_handler, args=(response,)).start() # log response
+                    return response
         except StopIteration:
             raise  # Re-raise StopIteration
         except Exception as e:
-            # Handle other exceptions if needed
+            print_verbose(f"HITS AN ERROR: {str(e)}")
+            traceback_exception = traceback.format_exc()
+            # LOG FAILURE - handle streaming failure logging in the _next_ object, remove `handle_failure` once it's deprecated
+            threading.Thread(target=self.logging_obj.failure_handler, args=(e, traceback_exception)).start()
             raise e
 
 
@@ -5491,17 +5768,30 @@ class CustomStreamWrapper:
                 async for chunk in self.completion_stream:
                     if chunk == "None" or chunk is None:
                         raise Exception
-                    processed_chunk = self.chunk_creator(chunk=chunk)
+
+                    # chunk_creator() does logging/stream chunk building. We need to let it know its being called in_async_func, so we don't double add chunks. 
+                    # __anext__ also calls async_success_handler, which does logging
+                    processed_chunk = self.chunk_creator(chunk=chunk) 
                     if processed_chunk is None: 
                         continue
                     ## LOGGING
+                    threading.Thread(target=self.logging_obj.success_handler, args=(processed_chunk,)).start() # log response
                     asyncio.create_task(self.logging_obj.async_success_handler(processed_chunk,))
                     return processed_chunk
                 raise StopAsyncIteration
             else: # temporary patch for non-aiohttp async calls
-                return next(self)
+                # example - boto3 bedrock llms
+                processed_chunk = next(self)
+                asyncio.create_task(self.logging_obj.async_success_handler(processed_chunk,))
+                return processed_chunk
+        except StopAsyncIteration:
+            raise
+        except StopIteration:
+            raise StopAsyncIteration  # Re-raise StopIteration
         except Exception as e:
+            traceback_exception = traceback.format_exc()
             # Handle any exceptions that might occur during streaming
+            asyncio.create_task(self.logging_obj.async_failure_handler(e, traceback_exception))
             raise StopAsyncIteration
 
 class TextCompletionStreamWrapper:

@@ -7,16 +7,18 @@
 #
 #  Thank you ! We ❤️ you! - Krrish & Ishaan 
 
+import copy
 from datetime import datetime
 from typing import Dict, List, Optional, Union, Literal, Any
-import random, threading, time, traceback
+import random, threading, time, traceback, uuid
 import litellm, openai
 from litellm.caching import RedisCache, InMemoryCache, DualCache
 import logging, asyncio
 import inspect, concurrent
 from openai import AsyncOpenAI
 from collections import defaultdict
-
+from litellm.router_strategy.least_busy import LeastBusyLoggingHandler
+import copy
 class Router:
     """
     Example usage:
@@ -53,10 +55,11 @@ class Router:
     ```
     """
     model_names: List = []
-    cache_responses: bool = False
+    cache_responses: Optional[bool] = False
     default_cache_time_seconds: int = 1 * 60 * 60  # 1 hour
     num_retries: int = 0
     tenacity = None
+    leastbusy_logger: Optional[LeastBusyLoggingHandler] = None
 
     def __init__(self,
                  model_list: Optional[list] = None,
@@ -65,7 +68,7 @@ class Router:
                  redis_host: Optional[str] = None,
                  redis_port: Optional[int] = None,
                  redis_password: Optional[str] = None,
-                 cache_responses: bool = False,
+                 cache_responses: Optional[bool] = False,
                  cache_kwargs: dict = {}, # additional kwargs to pass to RedisCache (see caching.py)
                  ## RELIABILITY ## 
                  num_retries: int = 0,
@@ -80,6 +83,7 @@ class Router:
         self.set_verbose = set_verbose 
         self.deployment_names: List = [] # names of models under litellm_params. ex. azure/chatgpt-v-2
         if model_list:
+            model_list = copy.deepcopy(model_list)
             self.set_model_list(model_list)
             self.healthy_deployments: List = self.model_list
             self.deployment_latency_map = {}
@@ -98,7 +102,7 @@ class Router:
         self.fail_calls: defaultdict = defaultdict(int)             # dict to store fail_calls made to each model
         self.success_calls: defaultdict = defaultdict(int)          # dict to store success_calls  made to each model
         self.previous_models: List = [] # list to store failed calls (passed in as metadata to next call)
-
+        
         # make Router.chat.completions.create compatible for openai.chat.completions.create
         self.chat = litellm.Chat(params=default_litellm_params)
 
@@ -107,10 +111,6 @@ class Router:
         self.default_litellm_params.setdefault("timeout", timeout)
         self.default_litellm_params.setdefault("max_retries", 0)
 
-
-        ### HEALTH CHECK THREAD ###
-        if self.routing_strategy == "least-busy":
-            self._start_health_check_thread()
         ### CACHING ###
         cache_type = "local" # default to an in-memory cache
         redis_cache = None
@@ -134,9 +134,21 @@ class Router:
             cache_config.update(cache_kwargs)
             redis_cache = RedisCache(**cache_config)
         if cache_responses:
-            litellm.cache = litellm.Cache(type=cache_type, **cache_config)
+            if litellm.cache is None:
+                # the cache can be initialized on the proxy server. We should not overwrite it
+                litellm.cache = litellm.Cache(type=cache_type, **cache_config)
             self.cache_responses = cache_responses
         self.cache = DualCache(redis_cache=redis_cache, in_memory_cache=InMemoryCache()) # use a dual cache (Redis+In-Memory) for tracking cooldowns, usage, etc.
+        ### ROUTING SETUP ### 
+        if routing_strategy == "least-busy":
+            self.leastbusy_logger = LeastBusyLoggingHandler(router_cache=self.cache) 
+            ## add callback
+            if isinstance(litellm.input_callback, list): 
+                litellm.input_callback.append(self.leastbusy_logger) # type: ignore
+            else: 
+                litellm.input_callback = [self.leastbusy_logger] # type: ignore
+            if isinstance(litellm.callbacks, list):
+                litellm.callbacks.append(self.leastbusy_logger) # type: ignore
         ## USAGE TRACKING ## 
         if isinstance(litellm.success_callback, list):
             litellm.success_callback.append(self.deployment_callback)
@@ -187,6 +199,7 @@ class Router:
             deployment = self.get_available_deployment(model=model, messages=messages, specific_deployment=kwargs.pop("specific_deployment", None))
             kwargs.setdefault("metadata", {}).update({"deployment": deployment["litellm_params"]["model"]})
             data = deployment["litellm_params"].copy()
+            kwargs["model_info"] = deployment.get("model_info", {})
             for k, v in self.default_litellm_params.items(): 
                 if k not in data: # prioritize model-specific params > default router params 
                     data[k] = v
@@ -234,6 +247,7 @@ class Router:
             original_model_string = None # set a default for this variable
             deployment = self.get_available_deployment(model=model, messages=messages, specific_deployment=kwargs.pop("specific_deployment", None))
             kwargs.setdefault("metadata", {}).update({"deployment": deployment["litellm_params"]["model"]})
+            kwargs["model_info"] = deployment.get("model_info", {})
             data = deployment["litellm_params"].copy()
             for k, v in self.default_litellm_params.items(): 
                 if k not in data: # prioritize model-specific params > default router params 
@@ -302,7 +316,8 @@ class Router:
                   **kwargs) -> Union[List[float], None]:
         # pick the one that is available (lowest TPM/RPM)
         deployment = self.get_available_deployment(model=model, input=input, specific_deployment=kwargs.pop("specific_deployment", None))
-        kwargs.setdefault("metadata", {}).update({"deployment": deployment["litellm_params"]["model"]})
+        kwargs.setdefault("model_info", {})
+        kwargs.setdefault("metadata", {}).update({"model_group": model, "deployment": deployment["litellm_params"]["model"]}) # [TODO]: move to using async_function_with_fallbacks
         data = deployment["litellm_params"].copy()
         for k, v in self.default_litellm_params.items(): 
             if k not in data: # prioritize model-specific params > default router params 
@@ -327,8 +342,9 @@ class Router:
                          **kwargs) -> Union[List[float], None]:
         # pick the one that is available (lowest TPM/RPM)
         deployment = self.get_available_deployment(model=model, input=input, specific_deployment=kwargs.pop("specific_deployment", None))
-        kwargs.setdefault("metadata", {}).update({"deployment": deployment["litellm_params"]["model"]})
+        kwargs.setdefault("metadata", {}).update({"model_group": model, "deployment": deployment["litellm_params"]["model"]})
         data = deployment["litellm_params"].copy()
+        kwargs["model_info"] = deployment.get("model_info", {})
         for k, v in self.default_litellm_params.items(): 
             if k not in data: # prioritize model-specific params > default router params 
                 data[k] = v
@@ -660,6 +676,7 @@ class Router:
             return kwargs
         except Exception as e: 
             raise e
+
     def _set_cooldown_deployments(self, 
                                   deployment: str):
         """
@@ -863,12 +880,16 @@ class Router:
         return chosen_item
 
     def set_model_list(self, model_list: list):
-        self.model_list = model_list
+        self.model_list = copy.deepcopy(model_list)
         # we add api_base/api_key each model so load balancing between azure/gpt on api_base1 and api_base2 works 
         import os
         for model in self.model_list:
             litellm_params = model.get("litellm_params", {})
             model_name = litellm_params.get("model")
+            #### MODEL ID INIT ########
+            model_info = model.get("model_info", {})
+            model_info["id"] = model_info.get("id", str(uuid.uuid4()))
+            model["model_info"] = model_info
             ####  for OpenAI / Azure we need to initalize the Client for High Traffic ########
             custom_llm_provider = litellm_params.get("custom_llm_provider")
             if custom_llm_provider is None:
@@ -1076,8 +1097,11 @@ class Router:
                 return deployment.get("client", None)
 
     def print_verbose(self, print_statement): 
-        if self.set_verbose or litellm.set_verbose: 
-            print(f"LiteLLM.Router: {print_statement}") # noqa
+        try:
+            if self.set_verbose or litellm.set_verbose: 
+                print(f"LiteLLM.Router: {print_statement}") # noqa
+        except:
+            pass
 
     def get_available_deployment(self,
                                model: str,
@@ -1112,8 +1136,8 @@ class Router:
         healthy_deployments = [m for m in self.model_list if m["model_name"] == model]
         if len(healthy_deployments) == 0: 
             # check if the user sent in a deployment name instead 
-
             healthy_deployments = [m for m in self.model_list if m["litellm_params"]["model"] == model]
+
         self.print_verbose(f"initial list of deployments: {healthy_deployments}")
         deployments_to_remove = [] 
         cooldown_deployments = self._get_cooldown_deployments()
@@ -1133,13 +1157,24 @@ class Router:
             model = litellm.model_alias_map[
                 model
             ]  # update the model to the actual value if an alias has been passed in
-        if self.routing_strategy == "least-busy":
-            if len(self.healthy_deployments) > 0:
-                for item in self.healthy_deployments:
-                    if item[0]["model_name"] == model: # first one in queue will be the one with the most availability
-                        return item[0]
+        if self.routing_strategy == "least-busy" and self.leastbusy_logger is not None:
+            deployments = self.leastbusy_logger.get_available_deployments(model_group=model)
+            # pick least busy deployment
+            min_traffic = float('inf')
+            min_deployment = None
+            for k, v in deployments.items(): 
+                if v < min_traffic:
+                    min_deployment = k
+            ############## No Available Deployments passed, we do a random pick #################
+            if min_deployment is None: 
+                min_deployment = random.choice(healthy_deployments)
+            ############## Available Deployments passed, we find the relevant item #################
             else: 
-                raise ValueError("No models available.")
+                for m in healthy_deployments: 
+                    if m["model_info"]["id"] == min_deployment:
+                        return m
+                min_deployment = random.choice(healthy_deployments)
+            return min_deployment 
         elif self.routing_strategy == "simple-shuffle": 
             # if users pass rpm or tpm, we do a random weighted pick - based on rpm/tpm
             ############## Check if we can do a RPM/TPM based weighted pick #################
@@ -1190,11 +1225,14 @@ class Router:
         raise ValueError("No models available.")
 
     def flush_cache(self):
+        litellm.cache = None
         self.cache.flush_cache()
     
     def reset(self): 
         ## clean up on close
         litellm.success_callback = [] 
+        litellm.__async_success_callback = [] 
         litellm.failure_callback = [] 
+        litellm._async_failure_callback = [] 
         self.flush_cache() 
         
